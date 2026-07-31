@@ -1,0 +1,477 @@
+package com.example.data.repository
+
+import com.example.data.local.dao.ChatMessageDao
+import com.example.data.local.dao.GpsLogDao
+import com.example.data.local.dao.OrderDao
+import com.example.data.local.dao.SyncQueueDao
+import com.example.data.local.entities.CarpetItemEntity
+import com.example.data.local.entities.ChatMessageEntity
+import com.example.data.local.entities.GpsLogEntity
+import com.example.data.local.entities.OrderEntity
+import com.example.data.local.entities.SyncQueueEntity
+import com.example.data.local.model.OrderWithItems
+import com.example.data.model.OrderStatus
+import com.example.data.remote.OfficeSettlementRequest
+import com.example.data.remote.OrderSyncRetrofitClient
+import com.example.data.remote.ReturnToWarehouseRequest
+import com.example.data.remote.SettleRequest
+import com.example.data.remote.SubmitItemsRequest
+import com.example.data.remote.UpdateStatusRequest
+import com.example.data.remote.toDriverOrderDto
+import com.example.data.remote.toEntities
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.withContext
+
+class ZomorrodRepository(
+    private val orderDao: OrderDao,
+    private val chatMessageDao: ChatMessageDao,
+    private val gpsLogDao: GpsLogDao,
+    private val syncQueueDao: SyncQueueDao? = null
+) {
+    val allOrders: Flow<List<OrderWithItems>> = orderDao.getAllOrdersWithItems()
+    val allChatMessages: Flow<List<ChatMessageEntity>> = chatMessageDao.getAllMessages()
+    val unsyncedOrdersCount: Flow<Int> = orderDao.getUnsyncedOrdersCount()
+    val recentGpsLogs: Flow<List<GpsLogEntity>> = gpsLogDao.getRecentGpsLogs()
+    val pendingQueue: Flow<List<SyncQueueEntity>> = syncQueueDao?.getPendingQueue() ?: flowOf(emptyList())
+    val pendingQueueCount: Flow<Int> = syncQueueDao?.getPendingCount() ?: flowOf(0)
+
+    private suspend fun enqueueSyncAction(
+        actionType: String,
+        orderId: String,
+        title: String,
+        payloadJson: String
+    ) {
+        syncQueueDao?.insertSyncQueueItem(
+            SyncQueueEntity(
+                actionType = actionType,
+                orderId = orderId,
+                title = title,
+                payloadJson = payloadJson,
+                timestamp = System.currentTimeMillis(),
+                status = "PENDING"
+            )
+        )
+    }
+
+    suspend fun insertOrder(order: OrderEntity) {
+        withContext(Dispatchers.IO) {
+            orderDao.insertOrder(order)
+        }
+    }
+
+    suspend fun getOrderWithItems(orderId: String): OrderWithItems? {
+        return withContext(Dispatchers.IO) {
+            orderDao.getOrderWithItemsById(orderId)
+        }
+    }
+
+    fun observeOrderWithItems(orderId: String): Flow<OrderWithItems?> {
+        return orderDao.observeOrderWithItemsById(orderId)
+    }
+
+    suspend fun addCarpetItemToOrder(orderId: String, item: CarpetItemEntity) {
+        withContext(Dispatchers.IO) {
+            orderDao.insertCarpetItem(item.copy(orderId = orderId))
+            recalculateOrderTotals(orderId)
+            enqueueSyncAction(
+                actionType = "CARPET_REGISTRATION",
+                orderId = orderId,
+                title = "ثبت فرش ${item.carpetType} (${item.areaSqMeter} م²) برای سفارش $orderId",
+                payloadJson = "{\"carpetType\":\"${item.carpetType}\",\"area\":${item.areaSqMeter},\"price\":${item.totalPrice},\"barcode\":\"${item.barcodeTag}\"}"
+            )
+        }
+    }
+
+    suspend fun removeCarpetItem(itemId: Long, orderId: String) {
+        withContext(Dispatchers.IO) {
+            orderDao.deleteCarpetItemById(itemId)
+            recalculateOrderTotals(orderId)
+            enqueueSyncAction(
+                actionType = "ITEM_DELETED",
+                orderId = orderId,
+                title = "حذف آیتم از فاکتور $orderId",
+                payloadJson = "{\"itemId\":$itemId}"
+            )
+        }
+    }
+
+    private suspend fun recalculateOrderTotals(orderId: String) {
+        val orderWithItems = orderDao.getOrderWithItemsById(orderId) ?: return
+        val totalAmount = orderWithItems.items.sumOf { it.totalPrice }
+        val newStatus = if (orderWithItems.items.isNotEmpty()) {
+            OrderStatus.COLLECTED
+        } else {
+            OrderStatus.ASSIGNED
+        }
+        val updatedOrder = orderWithItems.order.copy(
+            totalAmount = totalAmount,
+            status = newStatus,
+            isSynced = false,
+            updatedAt = System.currentTimeMillis()
+        )
+        orderDao.updateOrder(updatedOrder)
+    }
+
+    suspend fun updateRackAssignment(orderId: String, rackCode: String) {
+        withContext(Dispatchers.IO) {
+            orderDao.updateRackCode(orderId, rackCode)
+            enqueueSyncAction(
+                actionType = "RACK_ASSIGNMENT",
+                orderId = orderId,
+                title = "تخصیص قفسه $rackCode به سفارش $orderId",
+                payloadJson = "{\"rackCode\":\"$rackCode\"}"
+            )
+        }
+    }
+
+    suspend fun finalizeSettlement(
+        orderId: String,
+        paidAmount: Long,
+        discountAmount: Long,
+        paymentMethod: String
+    ) {
+        withContext(Dispatchers.IO) {
+            orderDao.updateSettlement(orderId, paidAmount, discountAmount, paymentMethod)
+            enqueueSyncAction(
+                actionType = "SETTLEMENT_FINALIZED",
+                orderId = orderId,
+                title = "تسویه حساب سفارش $orderId به مبلغ $paidAmount تومان ($paymentMethod)",
+                payloadJson = "{\"paidAmount\":$paidAmount,\"discount\":$discountAmount,\"method\":\"$paymentMethod\"}"
+            )
+        }
+    }
+
+    suspend fun updateOrderStatus(orderId: String, status: String) {
+        withContext(Dispatchers.IO) {
+            orderDao.updateOrderStatus(orderId, status)
+            enqueueSyncAction(
+                actionType = "ORDER_STATUS_UPDATE",
+                orderId = orderId,
+                title = "تغییر وضعیت سفارش $orderId به $status",
+                payloadJson = "{\"status\":\"$status\"}"
+            )
+        }
+    }
+
+    suspend fun sendChatMessage(orderId: String, messageText: String, sender: String = "DRIVER") {
+        withContext(Dispatchers.IO) {
+            val msg = ChatMessageEntity(
+                orderId = orderId,
+                sender = sender,
+                senderName = if (sender == "DRIVER") "پیک راننده" else "اپراتور مرکز (زمرد)",
+                messageText = messageText,
+                timestamp = System.currentTimeMillis()
+            )
+            chatMessageDao.insertMessage(msg)
+        }
+    }
+
+    suspend fun logGpsLocation(lat: Double, lng: Double, speedKmh: Float) {
+        withContext(Dispatchers.IO) {
+            val log = GpsLogEntity(
+                latitude = lat,
+                longitude = lng,
+                speedKmh = speedKmh,
+                timestamp = System.currentTimeMillis()
+            )
+            gpsLogDao.insertGpsLog(log)
+        }
+    }
+
+    suspend fun archiveSettledOrders() {
+        withContext(Dispatchers.IO) {
+            orderDao.archiveSettledOrders()
+        }
+    }
+
+    /**
+     * Real sync with the web panel (step 4 of the app<->panel coordination
+     * plan). PUSH: every locally-changed order is sent to the matching real
+     * endpoint based on its current status — failures are queued in
+     * syncQueueDao for automatic retry instead of being silently dropped.
+     * PULL: the driver's current collection/delivery routes are fetched
+     * from the server and merged into the local Room database.
+     */
+    suspend fun syncWithWebPanel(driverPhone: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val api = OrderSyncRetrofitClient.api
+
+                // --- Retry anything queued from a previous failed attempt ---
+                val queued = syncQueueDao?.getPendingItemsList() ?: emptyList()
+                for (item in queued) {
+                    val withItems = orderDao.getOrderWithItemsById(item.orderId)
+                    if (withItems != null) {
+                        val retryResponse = pushOrderByStatus(api, withItems.order, withItems.toDriverOrderDto(), driverPhone)
+                        if (retryResponse) syncQueueDao?.markAsSynced(item.id)
+                    }
+                }
+                syncQueueDao?.clearSyncedQueue()
+
+                // --- PUSH: upload every locally unsynced order ---
+                val unsynced = orderDao.getUnsyncedOrders()
+                for (entity in unsynced) {
+                    val withItems = orderDao.getOrderWithItemsById(entity.id) ?: continue
+                    val dto = withItems.toDriverOrderDto()
+                    val pushed = pushOrderByStatus(api, entity, dto, driverPhone)
+                    if (!pushed) {
+                        // Real server unreachable / request failed — queue for automatic retry
+                        // instead of losing the update.
+                        enqueueSyncAction(
+                            actionType = entity.status,
+                            orderId = entity.id,
+                            title = "بروزرسانی سفارش ${entity.id}",
+                            payloadJson = "{\"status\":\"${entity.status}\"}"
+                        )
+                    }
+                }
+                orderDao.markOrdersAsSynced(unsynced.map { it.id })
+
+                // Bulk end-of-day office settlement, if there are any orders ready for it.
+                val settledIds = unsynced.filter { it.status == OrderStatus.OFFICE_SETTLED }.map { it.id }
+                if (settledIds.isNotEmpty()) {
+                    try {
+                        api.officeSettlement(
+                            OfficeSettlementRequest(
+                                driverId = driverPhone,
+                                totalCash = 0L,
+                                totalPos = 0L,
+                                totalCardToCard = 0L,
+                                totalOnline = 0L,
+                                settledOrderIds = settledIds
+                            )
+                        )
+                    } catch (e: Exception) {
+                        // Will be retried on the next sync via the unsynced-orders path.
+                    }
+                }
+
+                // --- PULL: fetch this driver's current routes from the server ---
+                val collectionResponse = api.getCollectionRoute(driverPhone)
+                val deliveryResponse = api.getDeliveryRoute(driverPhone)
+
+                val incomingOrders = mutableListOf<com.example.data.remote.DriverOrderDto>()
+                if (collectionResponse.isSuccessful) {
+                    collectionResponse.body()?.orders?.let { incomingOrders.addAll(it) }
+                }
+                if (deliveryResponse.isSuccessful) {
+                    deliveryResponse.body()?.orders?.let { incomingOrders.addAll(it) }
+                }
+
+                for (dto in incomingOrders) {
+                    val (order, items) = dto.toEntities()
+                    orderDao.insertOrder(order)
+                    orderDao.insertCarpetItems(items)
+                }
+
+                val unsyncedGps = gpsLogDao.getUnsyncedGpsLogs()
+                if (unsyncedGps.isNotEmpty()) {
+                    gpsLogDao.markLogsAsSynced(unsyncedGps.map { it.id })
+                }
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /** Sends one order to the real endpoint that matches its current status. Returns whether it succeeded. */
+    private suspend fun pushOrderByStatus(
+        api: com.example.data.remote.OrderSyncApiService,
+        entity: OrderEntity,
+        dto: com.example.data.remote.DriverOrderDto,
+        driverPhone: String
+    ): Boolean {
+        return try {
+            val response = when (entity.status) {
+                OrderStatus.COLLECTED -> api.submitItems(
+                    entity.id,
+                    SubmitItemsRequest(items = dto.carpets, driverId = driverPhone, prepaidAmount = entity.paidAmount)
+                )
+                OrderStatus.RETURNED_TO_CLEAN_WAREHOUSE -> api.returnToWarehouse(
+                    entity.id,
+                    ReturnToWarehouseRequest(cleanRackCode = entity.rackCode, returnReason = entity.notes, driverId = driverPhone)
+                )
+                OrderStatus.DELIVERED_SETTLED -> api.settleOrder(
+                    entity.id,
+                    SettleRequest(paymentType = entity.paymentMethod, paidAmount = entity.paidAmount, remainingAmount = entity.totalAmount - entity.discountAmount - entity.paidAmount)
+                )
+                else -> api.updateStatus(
+                    entity.id,
+                    UpdateStatusRequest(status = entity.status, rackCode = entity.rackCode, notes = entity.notes)
+                )
+            }
+            response.isSuccessful
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Pushes the driver's real live GPS position to the server so the web
+     * panel's live map can show it. Silently ignores network failures — a
+     * missed location ping is not worth surfacing an error to the driver.
+     */
+    suspend fun pushLiveLocationToServer(
+        driverId: String,
+        latitude: Double,
+        longitude: Double,
+        speedMetersPerSecond: Float
+    ) {
+        withContext(Dispatchers.IO) {
+            try {
+                OrderSyncRetrofitClient.api.pushLiveLocation(
+                    com.example.data.remote.LiveLocationRequest(
+                        driverId = driverId,
+                        latitude = latitude,
+                        longitude = longitude,
+                        speedMetersPerSecond = speedMetersPerSecond,
+                        timestamp = System.currentTimeMillis()
+                    )
+                )
+            } catch (e: Exception) {
+                // Network unavailable or server unreachable — safe to ignore for a live ping.
+            }
+        }
+    }
+
+    suspend fun seedInitialDataIfEmpty() {
+        withContext(Dispatchers.IO) {
+            val existingCount = orderDao.getOrderCount()
+            if (existingCount > 0) return@withContext // Database already initialized with real data
+            val initialOrders = listOf(
+                OrderEntity(
+                    id = "ZM-1403-1042",
+                    customerName = "آقای سید محمدرضا طباطبایی",
+                    customerPhone = "09123456789",
+                    address = "تهران، ولنجک، خیابان چهاردهم، پلاک ۲۸، واحد ۴",
+                    notes = "دارای ۳ تخته فرش ۶ متری و ۱ تخته قالیچه ابریشم - درب منزل آسانسور دارد",
+                    latitude = 35.8080,
+                    longitude = 51.4080,
+                    orderType = "PICKUP",
+                    status = OrderStatus.ASSIGNED,
+                    routeOrder = 1,
+                    isSynced = true
+                ),
+                OrderEntity(
+                    id = "ZM-1403-1038",
+                    customerName = "خانم مهندس فاطمی",
+                    customerPhone = "09187654321",
+                    address = "تهران، شهرک غرب، فاز ۳، خیابان حسن سیف، کوچه دوم، پلاک ۱۵",
+                    notes = "فرش‌ها قبل از جمع‌آوری نیاز به بازبینی لکه‌های قهوه دارند. هماهنگی تلفنی قبل از حضور",
+                    latitude = 35.7550,
+                    longitude = 51.3620,
+                    orderType = "PICKUP",
+                    status = OrderStatus.ASSIGNED,
+                    routeOrder = 2,
+                    isSynced = true
+                ),
+                OrderEntity(
+                    id = "ZM-1403-1015",
+                    customerName = "دکتر مسعود بختیاری",
+                    customerPhone = "09121112233",
+                    address = "تهران، پاسداران، بوستان پنجم، پلاک ۸۲، واحد ۱",
+                    notes = "تحویل فرش‌های اعلاشویی شده. تسویه حساب کارتخوان یا نقدی در محل",
+                    latitude = 35.7680,
+                    longitude = 51.4610,
+                    orderType = "DELIVERY",
+                    status = OrderStatus.READY_FOR_DELIVERY,
+                    totalAmount = 1850000L,
+                    rackCode = "A-12",
+                    routeOrder = 3,
+                    isSynced = true
+                ),
+                OrderEntity(
+                    id = "ZM-1403-0994",
+                    customerName = "حاج علی‌اصغر کاظمی",
+                    customerPhone = "09139998877",
+                    address = "تهران، سعادت‌آباد، بالاتر از میدان کاج، خیابان علی‌اکبری، پلاک ۴",
+                    notes = "فرش ۹ متری ماشینی شسته شده آماده تحویل. تحویل قبل از ساعت ۱۸",
+                    latitude = 35.7820,
+                    longitude = 51.3780,
+                    orderType = "DELIVERY",
+                    status = OrderStatus.READY_FOR_DELIVERY,
+                    totalAmount = 920000L,
+                    rackCode = "B-04",
+                    routeOrder = 4,
+                    isSynced = true
+                )
+            )
+
+            orderDao.insertOrders(initialOrders)
+
+            // Seed items for order ZM-1403-1015
+            val itemsForOrder3 = listOf(
+                CarpetItemEntity(
+                    orderId = "ZM-1403-1015",
+                    carpetType = "ماشینی ۱۲ متری",
+                    lengthMeter = 4.0,
+                    widthMeter = 3.0,
+                    areaSqMeter = 12.0,
+                    unitPricePerMeter = 100000L,
+                    requestedServicesJson = "اعلاشویی، رفوگری شیرازه",
+                    defectsJson = "قدیمی - ساییدگی حاشیه",
+                    totalPrice = 1200000L,
+                    notes = "رفوگری با کیفیت انجام شده",
+                    barcodeTag = "ST-1015-01"
+                ),
+                CarpetItemEntity(
+                    orderId = "ZM-1403-1015",
+                    carpetType = "دستبافت نائین ۶ متری",
+                    lengthMeter = 3.0,
+                    widthMeter = 2.0,
+                    areaSqMeter = 6.0,
+                    unitPricePerMeter = 108333L,
+                    requestedServicesJson = "ابریشم‌شویی اختصاصی",
+                    defectsJson = "بدون عیب",
+                    totalPrice = 650000L,
+                    notes = "شستشوی دستبافت حساس",
+                    barcodeTag = "ST-1015-02"
+                )
+            )
+
+            // Seed items for order ZM-1403-0994
+            val itemsForOrder4 = listOf(
+                CarpetItemEntity(
+                    orderId = "ZM-1403-0994",
+                    carpetType = "ماشینی ۹ متری",
+                    lengthMeter = 3.5,
+                    widthMeter = 2.57,
+                    areaSqMeter = 9.0,
+                    unitPricePerMeter = 102222L,
+                    requestedServicesJson = "شستشوی ویژه و ریشه‌زنی",
+                    defectsJson = "لکه‌دار اولیه",
+                    totalPrice = 920000L,
+                    notes = "ریشه‌ها بازسازی شد",
+                    barcodeTag = "ST-0994-01"
+                )
+            )
+
+            orderDao.insertCarpetItems(itemsForOrder3)
+            orderDao.insertCarpetItems(itemsForOrder4)
+
+            // Seed initial chat messages
+            val chatSeed = listOf(
+                ChatMessageEntity(
+                    orderId = "GENERAL",
+                    sender = "DISPATCHER",
+                    senderName = "اپراتور مرکزی (زمرد)",
+                    messageText = "سلام آقای راننده، ۴ ماموریت جدید امروز برای شما فعال گردید. مسیر اول ولنجک می‌باشد.",
+                    timestamp = System.currentTimeMillis() - 3600000L,
+                    isSynced = true
+                ),
+                ChatMessageEntity(
+                    orderId = "GENERAL",
+                    sender = "DRIVER",
+                    senderName = "پیک راننده",
+                    messageText = "درود، متشکرم. حرکت به سمت مقصد اول در ولنجک.",
+                    timestamp = System.currentTimeMillis() - 3000000L,
+                    isSynced = true
+                )
+            )
+            chatMessageDao.insertMessages(chatSeed)
+        }
+    }
+}

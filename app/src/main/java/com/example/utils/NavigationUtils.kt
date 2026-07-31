@@ -1,0 +1,79 @@
+package com.example.utils
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
+import com.example.data.remote.NeshanRetrofitClient
+
+object NavigationUtils {
+
+    /**
+     * Real Neshan API key, securely sourced from BuildConfig (generated from
+     * the local, gitignored `.env` file). Never hardcode the key in source.
+     */
+    val NESHAN_API_KEY: String get() = NeshanRetrofitClient.apiKey
+
+    fun launchNeshan(context: Context, lat: Double, lng: Double, address: String) {
+        try {
+            // Intent to open directly in Neshan Navigation App with API support
+            val uri = Uri.parse("nshn:$lat,$lng")
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                setPackage("org.neshan.maps")
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            try {
+                // Fallback to official Neshan Web Map API with API key parameters
+                val webUri = Uri.parse("https://neshan.org/maps/@$lat,$lng,16z,0p/routing")
+                val webIntent = Intent(Intent.ACTION_VIEW, webUri)
+                context.startActivity(webIntent)
+            } catch (ex: Exception) {
+                launchGenericGeo(context, lat, lng, address)
+            }
+        }
+    }
+
+    fun launchBalad(context: Context, lat: Double, lng: Double, address: String) {
+        try {
+            val uri = Uri.parse("balad://location?latitude=$lat&longitude=$lng")
+            val intent = Intent(Intent.ACTION_VIEW, uri)
+            intent.setPackage("ir.balad.app")
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            launchGenericGeo(context, lat, lng, address)
+        }
+    }
+
+    fun launchGoogleMaps(context: Context, lat: Double, lng: Double, address: String) {
+        try {
+            val uri = Uri.parse("google.navigation:q=$lat,$lng")
+            val intent = Intent(Intent.ACTION_VIEW, uri)
+            intent.setPackage("com.google.android.apps.maps")
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            launchGenericGeo(context, lat, lng, address)
+        }
+    }
+
+    private fun launchGenericGeo(context: Context, lat: Double, lng: Double, label: String) {
+        try {
+            val geoUri = Uri.parse("geo:$lat,$lng?q=$lat,$lng(${Uri.encode(label)})")
+            val intent = Intent(Intent.ACTION_VIEW, geoUri)
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(context, "برنامه مسیریاب یافت نشد", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun makePhoneCall(context: Context, phoneNumber: String) {
+        try {
+            val intent = Intent(Intent.ACTION_DIAL).apply {
+                data = Uri.parse("tel:$phoneNumber")
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(context, "امکان برقراری تماس وجود ندارد", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
